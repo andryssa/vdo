@@ -1,0 +1,71 @@
+Первым делом - установим необходимые пакеты:
+
+# yum install vdo kmod-kvdo
+Для VDO я подключил к системе второй диск /dev/sdb размером 20Гб. На нём я создам дедуплицированный том размером 100Гб, на котором и будем тестировать.
+
+# vdo create --name=vdo --device=/dev/sdb --vdoLogicalSize=100G 
+Creating VDO vdo 
+Starting VDO vdo 
+Starting compression on VDO vdo 
+VDO instance 0 volume is ready at /dev/mapper/vdo
+Как видим, устройство создано и доступно по адресу /dev/mapper/vdo. Утилита vdostats показывает статистику томов:
+
+# vdostats --human-readable /dev/mapper/vdo 
+Device                    Size      Used Available Use% Space saving% 
+/dev/mapper/vdo          20.0G      4.0G     16.0G  20%           N/A
+Необычно - уже "занято" 4 гигабайта. Разметим файловую систему и подмонтируем её:
+
+# mkfs.xfs /dev/mapper/vdo 
+meta-data=/dev/mapper/vdo        isize=512    agcount=4, agsize=6553600 blks 
+         =                       sectsz=4096  attr=2, projid32bit=1 
+         =                       crc=1        finobt=0, sparse=0 
+data     =                       bsize=4096   blocks=26214400, imaxpct=25 
+         =                       sunit=0      swidth=0 blks 
+naming   =version 2              bsize=4096   ascii-ci=0 ftype=1 
+log      =internal log           bsize=4096   blocks=12800, version=2 
+         =                       sectsz=4096  sunit=1 blks, lazy-count=1 
+realtime =none                   extsz=4096   blocks=0, rtextents=0 
+# mkdir -p /mnt/vdo 
+# mount /dev/mapper/vdo /mnt/vdo/ 
+# df -h /mnt/vdo/ 
+Файловая система Размер Использовано  Дост Использовано% Cмонтировано в 
+/dev/mapper/vdo    100G          33M  100G            1% /mnt/vdo
+Уличная магия! Файловая система на 100 гигабайт готова к использованию! Создадим на ней файл размером 1 гигабайт:
+
+# dd if=/dev/urandom of=/mnt/vdo/random1 bs=1M count=1024             
+1024+0 записей получено 
+1024+0 записей отправлено 
+ скопировано 1073741824 байта (1,1 GB), 42,2853 c, 25,4 MB/c
+Теперь глянем статистику использования диска:
+
+# df -h /mnt/vdo 
+Файловая система Размер Использовано  Дост Использовано% Cмонтировано в 
+/dev/mapper/vdo    100G         1,1G   99G            2% /mnt/vdo
+# vdostats --human-readable /dev/mapper/vdo  
+Device                    Size      Used Available Use% Space saving% 
+/dev/mapper/vdo          20.0G      5.0G     15.0G  25%            4%
+Интересные ифры. На файловой системе занят 1 гигабайт, на томе VDO уже 5 и при этом указана "экономия" в 4%! Но это лишь повод тестировать дальше. Файл, созданный из содержимого /dev/urandom - это эталон несжимаемой и недедуплицируемой информации. Теперь создадим несколько его копий на этой-же файловой системе и посмотрим, что будет:
+
+# for i in {2..22}; do cp random1 random$i; done             
+# df -h /mnt/vdo                              
+Файловая система Размер Использовано  Дост Использовано% Cмонтировано в 
+/dev/mapper/vdo    100G          23G   78G           23% /mnt/vdo 
+[root@localhost vdo]# vdostats --human-readable /dev/mapper/vdo   
+Device                    Size      Used Available Use% Space saving% 
+/dev/mapper/vdo          20.0G      5.0G     15.0G  25%           95%
+А вот теперь уже интереснее! Файловая система рапортует, что занято 23 гигабайта, что больше размеров нашего блочного устройства. При этом, на стороне VDO ничего не поменялось: все копии не занимают места. Продолжим эксперимент и удалим все файлы:
+
+# rm -f random* 
+# df -h /mnt/vdo                             
+Файловая система Размер Использовано  Дост Использовано% Cмонтировано в 
+/dev/mapper/vdo    100G          33M  100G            1% /mnt/vdo 
+# vdostats --human-readable /dev/mapper/vdo  
+Device                    Size      Used Available Use% Space saving% 
+/dev/mapper/vdo          20.0G      5.0G     15.0G  25%           95%
+
+Файловая система вернулась в исходное состояние, но VDO рапортует всё те-же данные. Это вызвано тем, что блочный уровень не в курсе удаления блоков. Чтобы сообщить об этом, нужно смонтировать файловую систему с опцией trim либо провести его вручную:
+
+# fstrim /mnt/vdo/    
+# vdostats --human-readable /dev/mapper/vdo  
+Device                    Size      Used Available Use% Space saving% 
+/dev/mapper/vdo          20.0G      4.0G     16.0G  20%           99%
